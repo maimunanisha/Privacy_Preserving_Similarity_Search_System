@@ -1,0 +1,481 @@
+# Streamlit Privacy App (robust to missing Streamlit)
+# This file runs as a Streamlit app when the `streamlit` package is available.
+# If Streamlit is not installed in the environment, it falls back to a CLI demo
+# that shows the same core functionality so you won't see the ModuleNotFoundError.
+
+import sys
+import os
+import json
+import io
+import logging
+import base64
+from datetime import datetime
+import numpy as np
+
+# Optional imports that may not be present in sandboxed envs — we'll handle errors gracefully
+try:
+    import streamlit as st
+    IS_STREAMLIT = True
+except Exception:
+    IS_STREAMLIT = False
+
+# Import other dependencies; if missing, provide a clear message in CLI mode
+MISSING_LIBS = []
+try:
+    from phe import paillier
+except Exception:
+    paillier = None
+    MISSING_LIBS.append('phe')
+
+try:
+    from scipy.spatial import distance
+except Exception:
+    distance = None
+    MISSING_LIBS.append('scipy')
+
+try:
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+except Exception:
+    PCA = None
+    StandardScaler = None
+    MISSING_LIBS.append('scikit-learn')
+
+try:
+    import plotly.express as px
+except Exception:
+    px = None
+    # plotly is optional for CLI demo; only used when running Streamlit visualizations
+    MISSING_LIBS.append('plotly')
+
+# =====================
+# Utility: friendly missing libs reporter
+# =====================
+def missing_libs_message():
+    if not MISSING_LIBS:
+        return None
+
+    pkgs = ", ".join(MISSING_LIBS)
+    pip_cmd = "pip install " + " ".join(MISSING_LIBS)
+
+    return (
+        f"The following Python packages are missing or could not be imported: {pkgs}.\n"
+        f"Install them (for full functionality) with: {pip_cmd}"
+    )
+# =====================
+# LOGGING AND MONITORING
+# =====================
+class PrivacyLogger:
+    def __init__(self, log_file='privacy_search.log'):
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s: %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def log_search_operation(self, query_vector, results, user_id=None):
+        try:
+            log_entry = {
+                'timestamp': datetime.now().isoformat(),
+                'query_vector': np.array(query_vector).astype(float).tolist(),
+                'results_count': len(results),
+                'user_id': user_id or 'anonymous'
+            }
+            self.logger.info(f"Similarity Search: {json.dumps(log_entry)}")
+        except Exception as e:
+            # never fail the app because of logging
+            self.logger.error(f"Logging failed: {e}")
+
+# =====================
+# DATASET VALIDATION
+# =====================
+def validate_dataset(dataset, remove_outliers=False):
+    try:
+        dataset = np.array(dataset, dtype=float)
+        if dataset.ndim == 1:
+            dataset = dataset.reshape(-1, 1)
+
+        if np.isnan(dataset).any():
+            # If running in Streamlit show a warning, otherwise print
+            if IS_STREAMLIT:
+                st.warning("Dataset contains missing values. Filling missing values with 0.")
+            else:
+                print("[WARN] Dataset contains missing values. Filling missing values with 0.")
+            dataset = np.nan_to_num(dataset)
+
+        if remove_outliers:
+            means = np.mean(dataset, axis=0)
+            stds = np.std(dataset, axis=0)
+            z_scores = np.abs((dataset - means) / (stds + 1e-8))
+            mask = (z_scores < 3).all(axis=1)
+            removed = dataset.shape[0] - mask.sum()
+            dataset = dataset[mask]
+            if IS_STREAMLIT:
+                st.success(f"Outliers removed using Z-score method. Removed {removed} rows.")
+            else:
+                print(f"[INFO] Outliers removed using Z-score method. Removed {removed} rows.")
+
+        return True, dataset
+    except Exception as e:
+        if IS_STREAMLIT:
+            st.error(f"Dataset Validation Error: {e}")
+        else:
+            print(f"[ERROR] Dataset Validation Error: {e}")
+        return False, None
+
+# =====================
+# ENCRYPTION FUNCTIONS
+# =====================
+def generate_keys():
+    if paillier is None:
+        raise RuntimeError("Missing 'phe' library. Cannot generate Paillier keys.")
+    return paillier.generate_paillier_keypair()
+
+class MultiLayerEncryption:
+    def __init__(self, public_key):
+        self.public_key = public_key
+        self.salt = os.urandom(16)
+
+    def encrypt(self, data):
+        # return list of Paillier EncryptedNumber objects
+        return [self.public_key.encrypt(float(x)) for x in data]
+
+# =====================
+# DOWNLOAD UTILITY (Streamlit only)
+# =====================
+def create_download_link_from_encrypted(encrypted_data, filename="encrypted_dataset.csv"):
+    # Convert encrypted objects to string representation so it can be saved to CSV
+    rows = [[str(x.ciphertext()) for x in row] for row in encrypted_data]
+    csv_buffer = io.StringIO()
+    for r in rows:
+        csv_buffer.write(",".join(r) + "\n")
+    b64 = base64.b64encode(csv_buffer.getvalue().encode()).decode()
+    href = f'data:file/csv;base64,{b64}'
+    return href
+
+# =====================
+# VP-TREE IMPLEMENTATION
+# =====================
+class OptimizedVPTree:
+    def __init__(self, encrypted_data, private_key, distance_metric='euclidean'):
+        if distance is None:
+            raise RuntimeError("Missing 'scipy' library (scipy.spatial.distance). VP-Tree cannot be built.")
+        self.private_key = private_key
+        self.data = encrypted_data
+        self.cache = {}
+        self.distance_func = {
+            'euclidean': distance.euclidean,
+            'cosine': distance.cosine
+        }.get(distance_metric, distance.euclidean)
+
+        # Decrypt once and keep a parallel decrypted matrix for fast search
+        self._decrypted_matrix = np.array([self.decrypt_row(r) for r in self.data])
+
+        self.tree = self.build_tree(list(range(len(self.data))))
+
+    def decrypt_row(self, row):
+        return [self.private_key.decrypt(x) for x in row]
+
+    def cached_distance(self, idx1, idx2=None, vec=None):
+        # We support either idx1/idx2 or idx1 and vec
+        if vec is not None:
+            key = (('v', idx1), tuple(np.round(vec, 8)))
+            if key not in self.cache:
+                self.cache[key] = float(self.distance_func(self._decrypted_matrix[idx1], vec))
+            return self.cache[key]
+        else:
+            key = (idx1, idx2)
+            if key not in self.cache:
+                self.cache[key] = float(self.distance_func(self._decrypted_matrix[idx1], self._decrypted_matrix[idx2]))
+            return self.cache[key]
+
+    def build_tree(self, indices):
+        if not indices:
+            return None
+        vp_idx = indices[0]
+        if len(indices) == 1:
+            return {"vp_idx": vp_idx, "mu": None, "left": None, "right": None}
+
+        dists = [self.cached_distance(vp_idx, j) for j in indices[1:]]
+        mu = float(np.median(dists))
+        left_idx = [indices[i+1] for i, d in enumerate(dists) if d <= mu]
+        right_idx = [indices[i+1] for i, d in enumerate(dists) if d > mu]
+        return {"vp_idx": vp_idx, "mu": mu, "left": self.build_tree(left_idx), "right": self.build_tree(right_idx)}
+
+    def search(self, query_vec, k=3):
+        # compute distances to decrypted matrix
+        distances = [float(self.distance_func(query_vec, self._decrypted_matrix[i])) for i in range(len(self.data))]
+        idxs = np.argsort(distances)[:k]
+        return [self._decrypted_matrix[i] for i in idxs], [distances[i] for i in idxs]
+
+# =====================
+# VISUALIZATION HELPERS (Streamlit)
+# =====================
+def visualize_histogram_feature(dataset):
+    if px is None:
+        if IS_STREAMLIT:
+            st.warning("Plotly not available — cannot show histograms.")
+        else:
+            print("[WARN] Plotly not available — cannot show histograms.")
+        return
+    for i in range(dataset.shape[1]):
+        fig = px.histogram(dataset[:, i], nbins=30, title=f"Feature {i+1} Histogram")
+        st.plotly_chart(fig, use_container_width=True)
+
+def visualize_scatter(dataset):
+    if px is None or PCA is None:
+        if IS_STREAMLIT:
+            st.warning("Plotly or scikit-learn missing — cannot show scatter.")
+        else:
+            print("[WARN] Plotly or scikit-learn missing — cannot show scatter.")
+        return
+    pca = PCA(n_components=2)
+    reduced = pca.fit_transform(dataset)
+    fig = px.scatter(x=reduced[:, 0], y=reduced[:, 1], title="PCA Scatter Plot")
+    st.plotly_chart(fig, use_container_width=True)
+
+def visualize_histogram_pca(dataset):
+    if px is None or PCA is None:
+        if IS_STREAMLIT:
+            st.warning("Plotly or scikit-learn missing — cannot show PCA histogram.")
+        else:
+            print("[WARN] Plotly or scikit-learn missing — cannot show PCA histogram.")
+        return
+    pca = PCA(n_components=1)
+    reduced = pca.fit_transform(dataset).flatten()
+    fig = px.histogram(reduced, nbins=30, title="Dataset Histogram (PCA Reduced)")
+    st.plotly_chart(fig, use_container_width=True)
+
+# =====================
+# STREAMLIT APP
+# =====================
+CUSTOM_CSS = """
+<style>
+:root{ --accent:#7c3aed; --muted:#6b7280; }
+.stApp { background: linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%); }
+.card {background: white; border-radius:12px; padding:16px; box-shadow:0 6px 18px rgba(13,38,59,0.08);}
+.small-muted{color:var(--muted);font-size:0.9rem}
+.kv {display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.download-link{display:inline-block;padding:8px 12px;border-radius:8px;background:#efefef;text-decoration:none}
+</style>
+"""
+
+def streamlit_main():
+    st.set_page_config(page_title="Privacy-Preserving Similarity Search", page_icon="🔒", layout="wide")
+    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    st.markdown('<div class="title"><h1>🔒 Privacy-Preserving Similarity Search</h1><div class="small-muted">Upload → Encrypt → Build VP-Tree → Visualize → Search</div></div>', unsafe_allow_html=True)
+
+    # Show missing libs message if any
+    msg = missing_libs_message()
+    if msg:
+        st.warning(msg)
+
+    privacy_logger = PrivacyLogger()
+    try:
+        public_key, private_key = generate_keys()
+    except Exception as e:
+        st.error(f"Cannot generate Paillier keys: {e}")
+        return
+    encryption = MultiLayerEncryption(public_key)
+
+    # Sidebar controls
+    with st.sidebar:
+        st.header("⚙️ Dataset Controls")
+        uploaded_file = st.file_uploader("Upload CSV", type=["csv"] )
+        remove_outliers = st.checkbox("Remove Outliers Before Visualization", False)
+        st.markdown("---")
+        st.header("📡 Visualization Options")
+        show_visual = st.checkbox("Show Visualization", True)
+        chart_type = st.selectbox("Select Visualization Type", ["Histogram per Feature", "PCA Histogram", "PCA Scatter Plot"])
+        st.markdown("---")
+        st.header("🔍 Similarity Search")
+        query = st.text_input("Enter query (comma-separated):", help="Enter numeric values matching the feature count")
+        k = st.slider("Select top k results:", 1, 10, 3)
+        metric = st.selectbox("Distance metric:", ["euclidean", "cosine"]) 
+        st.markdown("---")
+        if st.button("Use example dataset"):
+            example = np.array([[1,2,3],[2,3,1],[4,2,5],[0,1,1],[3,3,3]], dtype=float)
+            st.session_state['example_dataset'] = example
+
+    # Main layout
+    left_col, right_col = st.columns((3,1))
+
+    with left_col:
+        if uploaded_file is not None:
+            try:
+                dataset = np.genfromtxt(uploaded_file, delimiter=",")
+            except Exception as e:
+                st.error(f"Could not read uploaded file: {e}")
+                return
+        elif 'example_dataset' in st.session_state:
+            dataset = st.session_state['example_dataset']
+        else:
+            dataset = None
+
+        if dataset is None:
+            st.info("🚀 Upload a dataset (CSV) to begin or click 'Use example dataset' in the sidebar.")
+            st.markdown('<div class="card"><strong>Tips:</strong><div class="small-muted">• CSV should be numeric only (no headers).<br>• Each row is a record, each column is a feature.</div></div>', unsafe_allow_html=True)
+            return
+
+        valid, dataset = validate_dataset(dataset, remove_outliers)
+        if not valid:
+            return
+
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("📊 Cleaned Dataset Preview")
+        st.dataframe(dataset)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        if StandardScaler is None:
+            st.error("scikit-learn is required for scaling and PCA. Please install scikit-learn.")
+            return
+
+        scaler = StandardScaler().fit(dataset)
+        dataset_scaled = scaler.transform(dataset)
+
+        with st.spinner('Encrypting dataset...'):
+            encrypted_dataset = [encryption.encrypt(row) for row in dataset_scaled]
+        st.success('Dataset encrypted (Paillier) — stored in memory for search.')
+
+        with st.spinner('Building VP-Tree...'):
+            try:
+                vp_tree = OptimizedVPTree(encrypted_dataset, private_key, distance_metric=metric)
+            except Exception as e:
+                st.error(f"VP-Tree build failed: {e}")
+                return
+        st.success('VP-Tree built.')
+
+        if show_visual:
+            st.subheader('Visualizations')
+            if chart_type == "Histogram per Feature":
+                visualize_histogram_feature(dataset_scaled)
+            elif chart_type == "PCA Histogram":
+                visualize_histogram_pca(dataset_scaled)
+            else:
+                visualize_scatter(dataset_scaled)
+
+        href = create_download_link_from_encrypted(encrypted_dataset)
+        st.markdown(f'<div class="kv"><div><strong>Encrypted dataset</strong><div class="small-muted">You can download the encrypted dataset (ciphertexts as integers).</div></div><div><a class="download-link" href="{href}" download="encrypted_dataset.csv">Download</a></div></div>', unsafe_allow_html=True)
+
+    with right_col:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader('🔎 Search Panel')
+
+        if query:
+            try:
+                query_vector = np.array([float(x.strip()) for x in query.split(",")])
+                if query_vector.size == 0:
+                    st.error('Empty query provided')
+                elif query_vector.size != dataset.shape[1]:
+                    st.error(f"Query must contain {dataset.shape[1]} values. You provided {query_vector.size}.")
+                else:
+                    query_scaled = scaler.transform(query_vector.reshape(1, -1)).flatten()
+                    results, distances = vp_tree.search(query_scaled, k=k)
+                    st.success(f"Top {k} most similar records (decrypted):")
+                    res_table = np.hstack([np.array(results), np.array(distances).reshape(-1,1)])
+                    cols = [f"F{i+1}" for i in range(dataset.shape[1])] + ['distance']
+                    import pandas as pd
+                    df_res = pd.DataFrame(res_table, columns=cols)
+                    st.table(df_res)
+                    privacy_logger.log_search_operation(query_scaled, results)
+            except ValueError:
+                st.error("Invalid query format. Enter numeric comma-separated values.")
+            except Exception as e:
+                st.error(f"Search failed: {e}")
+        else:
+            st.info('Enter a comma-separated numeric query in the sidebar to run similarity search.')
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+# =====================
+# CLI FALLBACK (when Streamlit is not available)
+# =====================
+
+def cli_demo():
+    print("Streamlit is not available in this environment. Running CLI demo instead.")
+    msg = missing_libs_message()
+    if msg:
+        print("\n" + msg + "\n")
+
+    if paillier is None or distance is None or StandardScaler is None:
+        print("Critical libraries are missing — cannot run full demo. See message above to install missing packages.")
+        return
+
+    # Create a small example dataset and run through the pipeline
+    example = np.array([[1,2,3],[2,3,1],[4,2,5],[0,1,1],[3,3,3]], dtype=float)
+    print("Example dataset:\n", example)
+
+    valid, data = validate_dataset(example, remove_outliers=False)
+    if not valid:
+        print("Dataset invalid; exiting.")
+        return
+
+    scaler = StandardScaler().fit(data)
+    data_scaled = scaler.transform(data)
+    print("\nScaled dataset:\n", data_scaled)
+
+    try:
+        public_key, private_key = generate_keys()
+    except Exception as e:
+        print(f"Failed to generate Paillier keys: {e}")
+        return
+
+    encryption = MultiLayerEncryption(public_key)
+    encrypted = [encryption.encrypt(row) for row in data_scaled]
+    print('\nEncrypted dataset (first row ciphertexts snippets):')
+    print([str(x.ciphertext())[:60] + '...' for x in encrypted[0]])
+
+    vp_tree = OptimizedVPTree(encrypted, private_key, distance_metric='euclidean')
+    query = np.array([1.0, 2.0, 2.0])
+    query_scaled = scaler.transform(query.reshape(1, -1)).flatten()
+    results, distances = vp_tree.search(query_scaled, k=3)
+    print('\nQuery (scaled):', query_scaled)
+    print('\nTop 3 results (decrypted rows):')
+    for r, d in zip(results, distances):
+        print('Row:', np.round(r, 4), 'Distance:', round(d, 6))
+
+    print('\nDemo finished. To run the Streamlit app, install Streamlit with: pip install streamlit\nThen run: streamlit run <this_file>.py')
+
+# =====================
+# ENTRY POINT
+# =====================
+if __name__ == '__main__':
+    if IS_STREAMLIT:
+        try:
+            streamlit_main()
+        except Exception as e:
+            # If Streamlit is present but something else fails, show helpful message
+            print(f"Streamlit app failed to start: {e}")
+            print("You can run the CLI demo instead.")
+            cli_demo()
+    else:
+        # Streamlit not installed: run CLI fallback and guide the user
+        print("[NOTICE] 'streamlit' package was not found. This environment cannot run the Streamlit UI.")
+        print("If you want the web UI, install Streamlit locally and run: pip install streamlit && streamlit run <this_file>.py")
+        cli_demo()
+
+
+
+
+/*st.sidebar.header("🔎 Query")
+        query_input = st.sidebar.text_input("Enter query values (comma-separated)")
+        if query_input:
+            query_vector = np.array([float(x) for x in query_input.split(',')])
+            loading_animation("Searching similar records...")
+            results = vp_tree.search(query_vector)
+            st.write("### 📌 Top Similar Records:")
+            st.dataframe(results)
+            privacy_logger.log_search_operation(query_vector, results)*/2025-12-02 13:11:24,110 - ERROR: Task exception was never retrieved
+future: <Task finished name='Task-2139' coro=<WebSocketProtocol13.write_message.<locals>.wrapper() done, defined at C:\Users\Sheikh Tauheed\AppData\Local\Programs\Python\Python312\Lib\site-packages\tornado\websocket.py:1111> exception=WebSocketClosedError()>
+Traceback (most recent call last):
+  File "C:\Users\Sheikh Tauheed\AppData\Local\Programs\Python\Python312\Lib\site-packages\tornado\websocket.py", line 1113, in wrapper
+    await fut
+tornado.iostream.StreamClosedError: Stream is closed
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\Sheikh Tauheed\AppData\Local\Programs\Python\Python312\Lib\site-packages\tornado\websocket.py", line 1115, in wrapper
+    raise WebSocketClosedError()
+tornado.websocket.WebSocketClosedError
